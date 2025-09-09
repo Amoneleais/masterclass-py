@@ -1,6 +1,56 @@
+import os
 from dotenv import load_dotenv
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import HumanMessage, SystemMessage
+from pydantic import BaseModel, Field
+from typing import List, Literal, Dict
+
 load_dotenv()
 
-import os
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 
-print(os.getenv('API_KEY'))
+# Importação do modelo Gemini 2.5 Flash
+llm = ChatGoogleGenerativeAI(model='gemini-2.5-flash', temperature=0, api_key=GEMINI_API_KEY)
+
+# Prompt para triagem inicial
+TRIAGEM_PROMPT = (
+    "Você é um triador de Service Desk para políticas internas da empresa Carraro Desenvolvimento. "
+    "Dada a mensagem do usuário, retorne SOMENTE um JSON com:\n"
+    "{\n"
+    '  "decisao": "AUTO_RESOLVER" | "PEDIR_INFO" | "ABRIR_CHAMADO",\n'
+    '  "urgencia": "BAIXA" | "MEDIA" | "ALTA",\n'
+    '  "campos_faltantes": ["..."]\n'
+    "}\n"
+    "Regras:\n"
+    '- **AUTO_RESOLVER**: Perguntas claras sobre regras ou procedimentos descritos nas políticas (Ex: "Posso reembolsar a internet do meu home office?", "Como funciona a política de alimentação em viagens?").\n'
+    '- **PEDIR_INFO**: Mensagens vagas ou que faltam informações para identificar o tema ou contexto (Ex: "Preciso de ajuda com uma política", "Tenho uma dúvida geral").\n'
+    '- **ABRIR_CHAMADO**: Pedidos de exceção, liberação, aprovação ou acesso especial, ou quando o usuário explicitamente pede para abrir um chamado (Ex: "Quero exceção para trabalhar 5 dias remoto.", "Solicito liberação para anexos externos.", "Por favor, abra um chamado para o RH.").'
+    "Analise a mensagem e decida a ação mais apropriada."    
+)
+
+# Definição do modelo de saída estruturada
+class TriagemOut(BaseModel):
+    decisao: Literal["AUTO_RESOLVER", "PEDIR_INFO", "ABRIR_CHAMADO"]
+    urgencia: Literal["BAIXA", "MEDIA", "ALTA"]
+    campos_faltantes: List[str] = Field(default_factory=list)
+
+triagem_chain = llm.with_structured_output(TriagemOut)
+
+# Função para realizar a triagem
+def triagem(mensagem: str) -> Dict:
+    saida: TriagemOut = triagem_chain.invoke([
+        SystemMessage(content=TRIAGEM_PROMPT),
+        HumanMessage(content=mensagem)
+    ])
+
+    return saida.model_dump()
+
+testes = [
+    "Gostaria de saber se posso trabalhar de casa 3 dias por semana.",
+    "Qual é a política de reembolso para despesas de viagem?",
+    "Preciso de ajuda com uma dúvida sobre férias.",
+    "Por favor, abra um chamado para o RH."
+]
+
+for t in testes:
+    print(triagem(t))
