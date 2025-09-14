@@ -1,5 +1,6 @@
 import os
 from dotenv import load_dotenv
+from typing import TypedDict, Optional
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_community.document_loaders import PyMuPDFLoader
@@ -7,8 +8,10 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import ChatPromptTemplate
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_community.vectorstores import FAISS
+from langgraph.graph import StateGraph, START, END
 from pydantic import BaseModel, Field
 from typing import List, Literal, Dict
+from IPython.display import display, Image
 from pathlib import Path
 import re, pathlib
 
@@ -148,4 +151,115 @@ for t in testes:
         for c in formatar_citacoes(resposta["docs"], t):
             print(f"- {c['documento']} (pág. {c['pagina']}): ...{c['trecho']}...")
     print(f"Contexto encontrado: {resposta['contexto_encontrado']}")
+    print("---")
+
+class AgentState(TypedDict):
+    mensagem: str
+    triagem: dict
+    resposta: Optional[str]
+    citacoes: List[dict]
+    rag_sucesso: bool
+    acao_final: str
+
+def node_triagem(state: AgentState) -> AgentState:
+    print("Executando nó de triagem...")
+    return {"triagem": triagem(state["mensagem"])}
+
+def node_auto_resolver(state: AgentState) -> AgentState:
+    print("Executando nó de auto-resolver...")
+    resposta_rag = rag(state["mensagem"])
+    update: AgentState = {
+        "resposta": resposta_rag["resposta"],
+        "citacoes": formatar_citacoes(resposta_rag["docs"], state["mensagem"]) if resposta_rag["contexto_encontrado"] else [],
+        "rag_sucesso": resposta_rag["contexto_encontrado"]
+    }
+    if resposta_rag["contexto_encontrado"]:
+        update["acao_final"] = "RESPONDER_USUARIO"
+    return update
+
+def node_pedir_info(state: AgentState) -> AgentState:
+    print("Executando nó de pedir info...")
+    campos = state["triagem"].get("campos_faltantes", [])
+    if not campos:
+        campos = ["detalhes sobre a dúvida ou pedido"]
+    pergunta = "Por favor, forneça as seguintes informações para que eu possa ajudar melhor: " + ", ".join(campos) + "."
+    return {"resposta": pergunta, "acao_final": "PEDIR_INFO_USUARIO"}
+
+def node_abrir_chamado(state: AgentState) -> AgentState:
+    print("Executando nó de abrir chamado...")
+    triagem = state["triagem"]
+    return {
+        "resposta": f"Sua solicitação foi encaminhada para abertura de chamado com urgência {triagem['urgencia']}. Descrição: {state['mensagem'][:140]}...",
+        "acao_final": "ABRIR_CHAMADO"
+    }
+
+KEYWORDS_ABRIR_TICKET = ["abrir chamado", "solicito liberação", "quero exceção", "por favor, abra um chamado", "preciso de aprovação", "necessito acesso especial"]
+
+def decidir_principal(state: AgentState) -> str:
+    print("Decidindo próximo nó...")
+    decisao = state["triagem"]["decisao"]
+    if decisao == "AUTO_RESOLVER":
+        return "AUTO_RESOLVER"
+    elif decisao == "PEDIR_INFO":
+        return "PEDIR_INFO"
+    elif decisao == "ABRIR_CHAMADO":
+        return "ABRIR_CHAMADO"
+    else:
+        msg_lower = state["mensagem"].lower()
+        if any(kw in msg_lower for kw in KEYWORDS_ABRIR_TICKET):
+            return "ABRIR_CHAMADO"
+        elif len(state["mensagem"].split()) < 5:
+            return "PEDIR_INFO"
+        else:
+            return "AUTO_RESOLVER"
+
+def decidir_pos_auto_resolver(state: AgentState) -> str:
+    print("Decidindo pós auto-resolver...")
+    if state.get("rag_sucesso"):
+        return "FIM"
+    else:
+        return "PEDIR_INFO"
+    
+workflow = StateGraph(AgentState)
+
+workflow.add_node('triagem', node_triagem)
+workflow.add_node('auto_resolver', node_auto_resolver)
+workflow.add_node('pedir_info', node_pedir_info)
+workflow.add_node('abrir_chamado', node_abrir_chamado)
+
+workflow.add_edge(START, 'triagem')
+workflow.add_conditional_edges('triagem', decidir_principal, {
+    "AUTO_RESOLVER": 'auto_resolver',
+    "PEDIR_INFO": 'pedir_info',
+    "ABRIR_CHAMADO": 'abrir_chamado'})
+
+workflow.add_conditional_edges('auto_resolver', decidir_pos_auto_resolver, {
+    "PEDIR_INFO": 'pedir_info',
+    "CHAMADO": 'abrir_chamado',
+    "FIM": END
+})
+
+grafo = workflow.compile()
+
+graph_bytes = grafo.get_graph().draw_mermaid_png()
+
+def salvar_grafo_imagem(bytes_img: bytes, nome_arquivo: str = "grafo.png"):
+    with open(nome_arquivo, "wb") as f:
+        f.write(bytes_img)
+    print(f"Grafo salvo em {nome_arquivo}")
+
+salvar_grafo_imagem(graph_bytes)
+
+for t in testes:
+    resposta_final = grafo.invoke({"mensagem": t})
+
+    triag = resposta_final.get("triagem", {})
+    print(f"Pergunta: {t}")
+    print(f"Decisão de triagem: {triag.get('decisao','N/A')}, Urgência: {triag.get('urgencia','N/A')}, Campos faltantes: {triag.get('campos_faltantes',[])}")
+    print(f"Ação final: {resposta_final.get('acao_final','N/A')}")
+    print(f"Resposta ao usuário: {resposta_final.get('resposta','N/A')}")
+    if resposta_final.get("citacoes"):
+        print("Citações:")
+        for c in resposta_final["citacoes"]:
+            print(f"- {c['documento']} (pág. {c['pagina']}): ...{c['trecho']}...")
     print("---")
